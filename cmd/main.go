@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/pierre-borckmans/hydra"
-	"github.com/pierre-borckmans/hydra/cmd/ui"
+	"github.com/tentacle-scylla/hydra"
+	"github.com/tentacle-scylla/hydra/cmd/ui"
 )
 
 // Version is set at build time via ldflags:
@@ -100,7 +100,7 @@ func printBanner() {
 		"",
 		ui.Highlight.Render(" Spin up test ScyllaDB clusters in seconds"),
 		"",
-		" " + ui.Muted.Render("github.com/pierre-borckmans/hydra") + "  " + ui.Cyan.Render("v"+Version),
+		" " + ui.Muted.Render("github.com/tentacle-scylla/hydra") + "  " + ui.Cyan.Render("v"+Version),
 		"",
 		"",
 		"",

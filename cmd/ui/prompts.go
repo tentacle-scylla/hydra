@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/charmbracelet/huh"
-	"github.com/pierre-borckmans/hydra"
+	"github.com/tentacle-scylla/hydra"
 )
 
 // UpConfig holds the configuration for the up command

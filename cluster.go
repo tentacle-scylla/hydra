@@ -546,9 +546,9 @@ const (
 	ProgressStopping        // stopping containers
 	ProgressRemoving        // removing containers/volumes/networks
 	// Manager-related progress types
-	ProgressStartingManager     // starting scylla-manager services
-	ProgressWaitingForManager   // waiting for manager to be ready
-	ProgressRegisteringCluster  // registering cluster with manager
+	ProgressStartingManager    // starting scylla-manager services
+	ProgressWaitingForManager  // waiting for manager to be ready
+	ProgressRegisteringCluster // registering cluster with manager
 )
 
 // SetProgressCallback sets a callback for progress updates

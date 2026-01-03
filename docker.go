@@ -225,7 +225,6 @@ func (d *DockerClient) PullImage(ctx context.Context, imageName string) error {
 	return nil
 }
 
-
 // PullImageIfNotExists pulls an image only if it doesn't exist locally
 func (d *DockerClient) PullImageIfNotExists(ctx context.Context, imageName string) (bool, error) {
 	exists, err := d.ImageExists(ctx, imageName)
