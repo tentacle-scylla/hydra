@@ -1,5 +1,10 @@
 # Hydra
 
+[![CI](https://github.com/tentacle-scylla/hydra/workflows/CI/badge.svg)](https://github.com/tentacle-scylla/hydra/actions)
+[![Go Report Card](https://goreportcard.com/badge/github.com/tentacle-scylla/hydra)](https://goreportcard.com/report/github.com/tentacle-scylla/hydra)
+[![PkgGoDev](https://pkg.go.dev/badge/github.com/tentacle-scylla/hydra)](https://pkg.go.dev/github.com/tentacle-scylla/hydra)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 Spin up ephemeral ScyllaDB clusters via Docker Compose. Useful for integration tests, local development, and experimenting with different configurations.
 
 ## Installation
