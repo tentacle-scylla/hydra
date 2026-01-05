@@ -32,6 +32,6 @@ release: fmt vet lint test
 		echo "Error: Working directory has uncommitted changes."; \
 		exit 1; \
 	fi
-	git tag $(VERSION)
-	git push origin main --tags
-	@echo "Release $(VERSION) created and pushed!"
+	git push origin main
+	gh release create $(VERSION) --generate-notes --latest
+	@echo "Release $(VERSION) created and published!"
