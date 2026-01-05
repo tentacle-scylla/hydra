@@ -940,7 +940,7 @@ func isPortAvailable(port int) bool {
 	if err != nil {
 		return false
 	}
-	listener.Close()
+	_ = listener.Close() // Ignore close error - we're just checking availability
 	return true
 }
 
