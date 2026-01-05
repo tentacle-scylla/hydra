@@ -3,6 +3,7 @@ package hydra
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -73,6 +74,11 @@ func (c *Cluster) Start(ctx context.Context) error {
 	imageName := fmt.Sprintf("scylladb/scylla:%s", c.Config.Version)
 	if err := c.pullImageWithProgress(ctx, imageName); err != nil {
 		return fmt.Errorf("failed to pull image: %w", err)
+	}
+
+	// Ensure Docker VM has sufficient aio-max-nr for ScyllaDB
+	if err := ensureAioMaxNr(); err != nil {
+		return fmt.Errorf("failed to configure system for ScyllaDB: %w", err)
 	}
 
 	// Report that we're starting containers
@@ -793,6 +799,13 @@ func GetAllUsedPorts() ([]int, error) {
 		return nil, err
 	}
 
+	// Get Manager ports
+	cmd = exec.Command("docker", "ps", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.manager-port\"}}")
+	managerOutput, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+
 	var ports []int
 	for _, line := range strings.Split(string(cqlOutput), "\n") {
 		line = strings.TrimSpace(line)
@@ -812,6 +825,17 @@ func GetAllUsedPorts() ([]int, error) {
 		port, err := strconv.Atoi(line)
 		if err == nil {
 			ports = append(ports, port)
+		}
+	}
+	for _, line := range strings.Split(string(managerOutput), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		port, err := strconv.Atoi(line)
+		if err == nil {
+			// Manager uses 2 consecutive ports
+			ports = append(ports, port, port+1)
 		}
 	}
 
@@ -841,7 +865,9 @@ func FindAvailablePort(nodeCount int) (int, error) {
 		for i := 0; i < nodeCount; i++ {
 			cqlPort := basePort + i
 			shardPort := basePort + 10000 + i
-			if usedSet[cqlPort] || usedSet[shardPort] {
+			// Check both the used set AND actual port availability
+			if usedSet[cqlPort] || usedSet[shardPort] ||
+			   !isPortAvailable(cqlPort) || !isPortAvailable(shardPort) {
 				conflict = true
 				break
 			}
@@ -858,6 +884,12 @@ func FindAvailablePort(nodeCount int) (int, error) {
 
 // CheckPortConflict checks if the given port range conflicts with existing clusters
 func CheckPortConflict(basePort, nodeCount int) (bool, string, error) {
+	return CheckPortConflictWithManager(basePort, nodeCount, false, 0)
+}
+
+// CheckPortConflictWithManager checks if the given port range conflicts with existing clusters,
+// including Manager ports if enabled
+func CheckPortConflictWithManager(basePort, nodeCount int, withManager bool, managerPort int) (bool, string, error) {
 	usedPorts, err := GetAllUsedPorts()
 	if err != nil {
 		return false, "", err
@@ -868,18 +900,79 @@ func CheckPortConflict(basePort, nodeCount int) (bool, string, error) {
 		usedSet[p] = true
 	}
 
+	// Check CQL and shard-aware ports for each node
 	for i := 0; i < nodeCount; i++ {
 		cqlPort := basePort + i
 		shardPort := basePort + 10000 + i
-		if usedSet[cqlPort] {
+		if usedSet[cqlPort] || !isPortAvailable(cqlPort) {
 			return true, fmt.Sprintf("CQL port %d is already in use", cqlPort), nil
 		}
-		if usedSet[shardPort] {
+		if usedSet[shardPort] || !isPortAvailable(shardPort) {
 			return true, fmt.Sprintf("shard-aware port %d is already in use", shardPort), nil
 		}
 	}
 
+	// Check Manager ports if enabled
+	if withManager {
+		if managerPort == 0 {
+			managerPort = DefaultManagerPort
+		}
+
+		// Manager uses two ports: HTTP API and HTTPS API
+		managerHTTPPort := managerPort
+		managerHTTPSPort := managerPort + 1
+
+		if usedSet[managerHTTPPort] || !isPortAvailable(managerHTTPPort) {
+			return true, fmt.Sprintf("Manager HTTP port %d is already in use", managerHTTPPort), nil
+		}
+		if usedSet[managerHTTPSPort] || !isPortAvailable(managerHTTPSPort) {
+			return true, fmt.Sprintf("Manager HTTPS port %d is already in use", managerHTTPSPort), nil
+		}
+	}
+
 	return false, "", nil
+}
+
+// isPortAvailable checks if a port is available by attempting to listen on it
+func isPortAvailable(port int) bool {
+	addr := fmt.Sprintf(":%d", port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return false
+	}
+	listener.Close()
+	return true
+}
+
+// FindAvailableManagerPort finds an available port for Scylla Manager
+func FindAvailableManagerPort() (int, error) {
+	usedPorts, err := GetAllUsedPorts()
+	if err != nil {
+		return 0, err
+	}
+
+	// Create a set of used ports for quick lookup
+	usedSet := make(map[int]bool)
+	for _, p := range usedPorts {
+		usedSet[p] = true
+	}
+
+	// Start from default Manager port and find a free port
+	// Manager uses 2 consecutive ports: HTTP and HTTPS
+	basePort := DefaultManagerPort
+	for basePort < 65535-1 {
+		httpPort := basePort
+		httpsPort := basePort + 1
+
+		// Check both that the ports aren't in our used set AND that they're actually available
+		if !usedSet[httpPort] && !usedSet[httpsPort] &&
+		   isPortAvailable(httpPort) && isPortAvailable(httpsPort) {
+			return basePort, nil
+		}
+		basePort++
+	}
+
+	return 0, fmt.Errorf("no available manager port found")
 }
 
 // ListClusters returns names of all tentacle clusters (running or stopped)
@@ -1360,10 +1453,21 @@ func (c *Cluster) startManagerServices(ctx context.Context) error {
 		}
 	}
 
+	// Ensure Docker VM has sufficient aio-max-nr for ScyllaDB
+	if err := ensureAioMaxNr(); err != nil {
+		return fmt.Errorf("failed to configure system for ScyllaDB: %w", err)
+	}
+
+	// Get node count for progress reporting
+	nodes := buildNodeSpecs(c.Config)
+	nodeCount := len(nodes)
+
 	// Start manager-db first (it needs to be ready before manager)
 	c.reportProgress(ProgressEvent{
-		Type:    ProgressStartingManager,
-		Message: "Starting Scylla Manager database...",
+		Type:       ProgressStartingManager,
+		Message:    "Starting Scylla Manager database...",
+		NodesReady: nodeCount,
+		NodesTotal: nodeCount,
 	})
 	if err := c.runDockerCompose(ctx, "up", "-d", "scylla-manager-db"); err != nil {
 		return fmt.Errorf("failed to start manager-db: %w", err)
@@ -1371,8 +1475,10 @@ func (c *Cluster) startManagerServices(ctx context.Context) error {
 
 	// Wait for manager-db to be ready
 	c.reportProgress(ProgressEvent{
-		Type:    ProgressWaitingForManager,
-		Message: "Waiting for Manager database to be ready...",
+		Type:       ProgressWaitingForManager,
+		Message:    "Waiting for Manager database to be ready...",
+		NodesReady: nodeCount,
+		NodesTotal: nodeCount,
 	})
 	if err := c.waitForManagerDB(ctx); err != nil {
 		return fmt.Errorf("manager-db failed to become ready: %w", err)
@@ -1380,23 +1486,26 @@ func (c *Cluster) startManagerServices(ctx context.Context) error {
 
 	// Start the manager service
 	c.reportProgress(ProgressEvent{
-		Type:    ProgressStartingManager,
-		Message: "Starting Scylla Manager...",
+		Type:       ProgressStartingManager,
+		Message:    "Starting Scylla Manager...",
+		NodesReady: nodeCount,
+		NodesTotal: nodeCount,
 	})
 	if err := c.runDockerCompose(ctx, "up", "-d", "scylla-manager"); err != nil {
 		return fmt.Errorf("failed to start manager: %w", err)
 	}
 
 	// Start all agent sidecars
-	nodes := buildNodeSpecs(c.Config)
 	agentNames := make([]string, len(nodes))
 	for i, node := range nodes {
 		agentNames[i] = fmt.Sprintf("agent-%s", node.name)
 	}
 
 	c.reportProgress(ProgressEvent{
-		Type:    ProgressStartingManager,
-		Message: fmt.Sprintf("Starting %d Manager agent(s)...", len(agentNames)),
+		Type:       ProgressStartingManager,
+		Message:    fmt.Sprintf("Starting %d Manager agent(s)...", len(agentNames)),
+		NodesReady: nodeCount,
+		NodesTotal: nodeCount,
 	})
 	args := append([]string{"up", "-d"}, agentNames...)
 	if err := c.runDockerCompose(ctx, args...); err != nil {
@@ -1405,8 +1514,10 @@ func (c *Cluster) startManagerServices(ctx context.Context) error {
 
 	// Wait for manager to be ready (check health endpoint)
 	c.reportProgress(ProgressEvent{
-		Type:    ProgressWaitingForManager,
-		Message: "Waiting for Scylla Manager to be ready...",
+		Type:       ProgressWaitingForManager,
+		Message:    "Waiting for Scylla Manager to be ready...",
+		NodesReady: nodeCount,
+		NodesTotal: nodeCount,
 	})
 	if err := c.waitForManager(ctx); err != nil {
 		return fmt.Errorf("manager failed to become ready: %w", err)
@@ -1414,19 +1525,25 @@ func (c *Cluster) startManagerServices(ctx context.Context) error {
 
 	// Register the cluster with the manager
 	c.reportProgress(ProgressEvent{
-		Type:    ProgressRegisteringCluster,
-		Message: "Registering cluster with Scylla Manager...",
+		Type:       ProgressRegisteringCluster,
+		Message:    "Registering cluster with Scylla Manager...",
+		NodesReady: nodeCount,
+		NodesTotal: nodeCount,
 	})
 	if err := c.registerClusterWithManager(ctx); err != nil {
 		// Log but don't fail - the cluster is still usable without manager registration
 		c.reportProgress(ProgressEvent{
-			Type:    ProgressRegisteringCluster,
-			Message: fmt.Sprintf("Warning: Failed to register cluster with Manager: %v", err),
+			Type:       ProgressRegisteringCluster,
+			Message:    fmt.Sprintf("Warning: Failed to register cluster with Manager: %v", err),
+			NodesReady: nodeCount,
+			NodesTotal: nodeCount,
 		})
 	} else {
 		c.reportProgress(ProgressEvent{
-			Type:    ProgressRegisteringCluster,
-			Message: "Cluster registered with Scylla Manager",
+			Type:       ProgressRegisteringCluster,
+			Message:    "Cluster registered with Scylla Manager",
+			NodesReady: nodeCount,
+			NodesTotal: nodeCount,
 		})
 	}
 
@@ -1510,6 +1627,28 @@ func (c *Cluster) registerClusterWithManager(ctx context.Context) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("sctool cluster add failed: %w (output: %s)", err, string(output))
+	}
+
+	return nil
+}
+
+// ensureAioMaxNr ensures the Docker VM has sufficient aio-max-nr for ScyllaDB
+// This is particularly important on macOS where the default limit is often too low
+func ensureAioMaxNr() error {
+	// Required value for ScyllaDB (10M to support multiple nodes)
+	// Each ScyllaDB node needs significant AIO capacity, especially with Manager
+	requiredValue := "10485760"
+
+	// Use nsenter to access the Docker VM's /proc filesystem
+	// This works on Docker Desktop for Mac/Windows
+	cmd := exec.Command("docker", "run", "--rm", "--privileged", "--pid=host",
+		"justincormack/nsenter1", "/bin/sh", "-c",
+		fmt.Sprintf("echo %s > /proc/sys/fs/aio-max-nr", requiredValue))
+
+	if err := cmd.Run(); err != nil {
+		// If this fails, it might be because we're on Linux (not needed) or the user
+		// doesn't have the nsenter image. We'll just warn and continue.
+		return nil // Don't fail the cluster creation, just continue
 	}
 
 	return nil
