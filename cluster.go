@@ -9,10 +9,93 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gocql/gocql"
 )
+
+// Common locations for Docker binaries on macOS
+var dockerSearchPaths = []string{
+	"/usr/local/bin/docker",
+	"/opt/homebrew/bin/docker",
+}
+
+var dockerComposeSearchPaths = []string{
+	"/usr/local/bin/docker-compose",
+	"/opt/homebrew/bin/docker-compose",
+}
+
+var (
+	cachedDockerPath        string
+	cachedDockerComposePath string
+	dockerPathOnce          sync.Once
+	dockerComposePathOnce   sync.Once
+)
+
+// findDockerBinary finds the docker binary in PATH or common locations
+func findDockerBinary() string {
+	dockerPathOnce.Do(func() {
+		// First try exec.LookPath (uses PATH)
+		if path, err := exec.LookPath("docker"); err == nil {
+			cachedDockerPath = path
+			return
+		}
+
+		// Fall back to common locations
+		for _, path := range dockerSearchPaths {
+			if _, err := os.Stat(path); err == nil {
+				cachedDockerPath = path
+				return
+			}
+		}
+	})
+	return cachedDockerPath
+}
+
+// findDockerComposeBinary finds the docker-compose binary in PATH or common locations
+func findDockerComposeBinary() string {
+	dockerComposePathOnce.Do(func() {
+		// First try exec.LookPath (uses PATH)
+		if path, err := exec.LookPath("docker-compose"); err == nil {
+			cachedDockerComposePath = path
+			return
+		}
+
+		// Fall back to common locations
+		for _, path := range dockerComposeSearchPaths {
+			if _, err := os.Stat(path); err == nil {
+				cachedDockerComposePath = path
+				return
+			}
+		}
+	})
+	return cachedDockerComposePath
+}
+
+// dockerCommand creates an exec.Command for docker with the binary found in PATH or common locations
+func dockerCommand(ctx context.Context, args ...string) *exec.Cmd {
+	dockerPath := findDockerBinary()
+	if dockerPath == "" {
+		dockerPath = "docker" // Fall back to PATH if not found
+	}
+	if ctx != nil {
+		return exec.CommandContext(ctx, dockerPath, args...)
+	}
+	return exec.Command(dockerPath, args...)
+}
+
+// dockerComposeCommand creates an exec.Command for docker-compose with the binary found in PATH or common locations
+func dockerComposeCommand(ctx context.Context, args ...string) *exec.Cmd {
+	dockerComposePath := findDockerComposeBinary()
+	if dockerComposePath == "" {
+		dockerComposePath = "docker-compose" // Fall back to PATH if not found
+	}
+	if ctx != nil {
+		return exec.CommandContext(ctx, dockerComposePath, args...)
+	}
+	return exec.Command(dockerComposePath, args...)
+}
 
 // Cluster represents a managed test cluster
 type Cluster struct {
@@ -470,7 +553,7 @@ func (c *Cluster) Logs(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("cluster not started")
 	}
 
-	cmd := exec.CommandContext(ctx, "docker-compose", "-f", c.composeFile, "logs")
+	cmd := dockerComposeCommand(ctx, "-f", c.composeFile, "logs")
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
@@ -481,7 +564,7 @@ func (c *Cluster) Status(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("cluster not started")
 	}
 
-	cmd := exec.CommandContext(ctx, "docker-compose", "-f", c.composeFile, "ps")
+	cmd := dockerComposeCommand(ctx, "-f", c.composeFile, "ps")
 	output, err := cmd.CombinedOutput()
 	return string(output), err
 }
@@ -489,7 +572,7 @@ func (c *Cluster) Status(ctx context.Context) (string, error) {
 // runDockerCompose runs a docker-compose command
 func (c *Cluster) runDockerCompose(ctx context.Context, args ...string) error {
 	fullArgs := append([]string{"-f", c.composeFile}, args...)
-	cmd := exec.CommandContext(ctx, "docker-compose", fullArgs...)
+	cmd := dockerComposeCommand(ctx, fullArgs...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
@@ -741,13 +824,17 @@ func StartDefaultCluster(ctx context.Context) (*Cluster, error) {
 
 // IsDockerAvailable checks if Docker is available
 func IsDockerAvailable() bool {
-	cmd := exec.Command("docker", "info")
+	dockerPath := findDockerBinary()
+	if dockerPath == "" {
+		return false
+	}
+	cmd := exec.Command(dockerPath, "info")
 	return cmd.Run() == nil
 }
 
 // IsClusterRunning checks if a cluster with the given name is running
 func IsClusterRunning(name string) bool {
-	cmd := exec.Command("docker", "ps", "--filter", "label=tentacle.cluster="+name, "--format", "{{.Names}}")
+	cmd := dockerCommand(context.TODO(), "ps", "--filter", "label=tentacle.cluster="+name, "--format", "{{.Names}}")
 	output, err := cmd.Output()
 	if err != nil {
 		return false
@@ -757,7 +844,7 @@ func IsClusterRunning(name string) bool {
 
 // ClusterExists checks if a cluster with the given name exists (running or stopped)
 func ClusterExists(name string) bool {
-	cmd := exec.Command("docker", "ps", "-a", "--filter", "label=tentacle.cluster="+name, "--format", "{{.Names}}")
+	cmd := dockerCommand(context.TODO(), "ps", "-a", "--filter", "label=tentacle.cluster="+name, "--format", "{{.Names}}")
 	output, err := cmd.Output()
 	if err != nil {
 		return false
@@ -767,7 +854,7 @@ func ClusterExists(name string) bool {
 
 // GetRunningClusterPort returns the CQL port of a running cluster's first node
 func GetRunningClusterPort(name string) (int, error) {
-	cmd := exec.Command("docker", "ps", "--filter", "label=tentacle.cluster="+name, "--format", "{{.Label \"tentacle.cql-port\"}}")
+	cmd := dockerCommand(context.TODO(), "ps", "--filter", "label=tentacle.cluster="+name, "--format", "{{.Label \"tentacle.cql-port\"}}")
 	output, err := cmd.Output()
 	if err != nil {
 		return 0, err
@@ -786,21 +873,21 @@ func GetRunningClusterPort(name string) (int, error) {
 // GetAllUsedPorts returns all CQL and shard-aware ports used by running tentacle clusters
 func GetAllUsedPorts() ([]int, error) {
 	// Get all CQL ports
-	cmd := exec.Command("docker", "ps", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.cql-port\"}}")
+	cmd := dockerCommand(context.TODO(), "ps", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.cql-port\"}}")
 	cqlOutput, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
 
 	// Get all shard ports
-	cmd = exec.Command("docker", "ps", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.shard-port\"}}")
+	cmd = dockerCommand(context.TODO(), "ps", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.shard-port\"}}")
 	shardOutput, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}
 
 	// Get Manager ports
-	cmd = exec.Command("docker", "ps", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.manager-port\"}}")
+	cmd = dockerCommand(context.TODO(), "ps", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.manager-port\"}}")
 	managerOutput, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -977,7 +1064,7 @@ func FindAvailableManagerPort() (int, error) {
 
 // ListClusters returns names of all tentacle clusters (running or stopped)
 func ListClusters() ([]string, error) {
-	cmd := exec.Command("docker", "ps", "-a", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.cluster\"}}")
+	cmd := dockerCommand(context.TODO(), "ps", "-a", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.cluster\"}}")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -999,7 +1086,7 @@ func ListClusters() ([]string, error) {
 
 // ListRunningClusters returns names of running tentacle clusters
 func ListRunningClusters() ([]string, error) {
-	cmd := exec.Command("docker", "ps", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.cluster\"}}")
+	cmd := dockerCommand(context.TODO(), "ps", "--filter", "label=tentacle.cluster", "--format", "{{.Label \"tentacle.cluster\"}}")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -1038,7 +1125,7 @@ func StopClusterByNameWithProgress(ctx context.Context, name string, progressCb 
 	})
 
 	// Get all container IDs for this cluster
-	cmd := exec.CommandContext(ctx, "docker", "ps", "-q", "--filter", "label=tentacle.cluster="+name)
+	cmd := dockerCommand(ctx, "ps", "-q", "--filter", "label=tentacle.cluster="+name)
 	output, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
@@ -1061,7 +1148,7 @@ func StopClusterByNameWithProgress(ctx context.Context, name string, progressCb 
 
 	// Stop all containers
 	args := append([]string{"stop"}, containerIDs...)
-	cmd = exec.CommandContext(ctx, "docker", args...)
+	cmd = dockerCommand(ctx, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -1082,7 +1169,7 @@ func StopClusterByNameWithProgress(ctx context.Context, name string, progressCb 
 // and waits for them to be ready. It accepts an optional progress callback.
 func StartClusterByName(ctx context.Context, name string, progressCb ProgressCallback) error {
 	// Get all stopped container IDs for this cluster
-	cmd := exec.CommandContext(ctx, "docker", "ps", "-aq", "--filter", "label=tentacle.cluster="+name, "--filter", "status=exited")
+	cmd := dockerCommand(ctx, "ps", "-aq", "--filter", "label=tentacle.cluster="+name, "--filter", "status=exited")
 	output, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
@@ -1095,7 +1182,7 @@ func StartClusterByName(ctx context.Context, name string, progressCb ProgressCal
 
 	// Start all containers
 	args := append([]string{"start"}, containerIDs...)
-	cmd = exec.CommandContext(ctx, "docker", args...)
+	cmd = dockerCommand(ctx, args...)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -1123,7 +1210,7 @@ type clusterNodeInfo struct {
 // getClusterNodeInfo returns node info for all containers in a cluster
 func getClusterNodeInfo(ctx context.Context, clusterName string) ([]clusterNodeInfo, error) {
 	// Get node info using docker inspect format with multiple labels
-	cmd := exec.CommandContext(ctx, "docker", "ps", "--filter", "label=tentacle.cluster="+clusterName,
+	cmd := dockerCommand(ctx, "ps", "--filter", "label=tentacle.cluster="+clusterName,
 		"--format", "{{.Label \"tentacle.node\"}}|{{.Label \"tentacle.cql-port\"}}|{{.Label \"tentacle.dc\"}}|{{.Label \"tentacle.rack\"}}")
 	output, err := cmd.Output()
 	if err != nil {
@@ -1281,7 +1368,7 @@ func checkPortReady(port int) bool {
 
 // ListStoppedClusters returns names of stopped tentacle clusters
 func ListStoppedClusters() ([]string, error) {
-	cmd := exec.Command("docker", "ps", "-a", "--filter", "label=tentacle.cluster", "--filter", "status=exited", "--format", "{{.Label \"tentacle.cluster\"}}")
+	cmd := dockerCommand(context.TODO(), "ps", "-a", "--filter", "label=tentacle.cluster", "--filter", "status=exited", "--format", "{{.Label \"tentacle.cluster\"}}")
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -1320,7 +1407,7 @@ func DestroyClusterByNameWithProgress(ctx context.Context, name string, progress
 	})
 
 	// Get all container IDs for this cluster
-	cmd := exec.CommandContext(ctx, "docker", "ps", "-aq", "--filter", "label=tentacle.cluster="+name)
+	cmd := dockerCommand(ctx, "ps", "-aq", "--filter", "label=tentacle.cluster="+name)
 	output, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to list containers: %w", err)
@@ -1335,7 +1422,7 @@ func DestroyClusterByNameWithProgress(ctx context.Context, name string, progress
 
 		// Stop containers first
 		args := append([]string{"stop"}, containerIDs...)
-		cmd = exec.CommandContext(ctx, "docker", args...)
+		cmd = dockerCommand(ctx, args...)
 		_ = cmd.Run() // Ignore errors, containers might already be stopped
 
 		reportProgress(ProgressEvent{
@@ -1345,7 +1432,7 @@ func DestroyClusterByNameWithProgress(ctx context.Context, name string, progress
 
 		// Remove containers with volumes
 		args = append([]string{"rm", "-v"}, containerIDs...)
-		cmd = exec.CommandContext(ctx, "docker", args...)
+		cmd = dockerCommand(ctx, args...)
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err != nil {
@@ -1360,23 +1447,23 @@ func DestroyClusterByNameWithProgress(ctx context.Context, name string, progress
 
 	// Remove networks associated with this cluster
 	// Networks can be named either "name-net" or with docker-compose prefix like "projectname_name-net"
-	cmd = exec.CommandContext(ctx, "docker", "network", "ls", "-q", "--filter", "name="+name)
+	cmd = dockerCommand(ctx, "network", "ls", "-q", "--filter", "name="+name)
 	output, err = cmd.Output()
 	if err == nil {
 		networks := strings.Fields(string(output))
 		for _, network := range networks {
-			rmCmd := exec.CommandContext(ctx, "docker", "network", "rm", network)
+			rmCmd := dockerCommand(ctx, "network", "rm", network)
 			_ = rmCmd.Run() // Ignore errors, network might be in use or already removed
 		}
 	}
 
 	// Also try the exact network name pattern
 	networkName := name + "-net"
-	cmd = exec.CommandContext(ctx, "docker", "network", "rm", networkName)
+	cmd = dockerCommand(ctx, "network", "rm", networkName)
 	_ = cmd.Run() // Ignore errors, network might not exist
 
 	// Prune any dangling networks (this helps clean up orphaned networks)
-	cmd = exec.CommandContext(ctx, "docker", "network", "prune", "-f")
+	cmd = dockerCommand(ctx, "network", "prune", "-f")
 	_ = cmd.Run() // Best effort
 
 	reportProgress(ProgressEvent{
@@ -1385,13 +1472,13 @@ func DestroyClusterByNameWithProgress(ctx context.Context, name string, progress
 	})
 
 	// Remove named volumes
-	cmd = exec.CommandContext(ctx, "docker", "volume", "ls", "-q", "--filter", "name="+name+"-")
+	cmd = dockerCommand(ctx, "volume", "ls", "-q", "--filter", "name="+name+"-")
 	output, err = cmd.Output()
 	if err == nil {
 		volumes := strings.Fields(string(output))
 		if len(volumes) > 0 {
 			args := append([]string{"volume", "rm"}, volumes...)
-			cmd = exec.CommandContext(ctx, "docker", args...)
+			cmd = dockerCommand(ctx, args...)
 			_ = cmd.Run() // Best effort
 		}
 	}
@@ -1407,7 +1494,7 @@ func DestroyClusterByNameWithProgress(ctx context.Context, name string, progress
 // GetClusterLogs returns logs for a running cluster by name
 func GetClusterLogs(ctx context.Context, name string) (string, error) {
 	// Get all container IDs for this cluster
-	cmd := exec.CommandContext(ctx, "docker", "ps", "-q", "--filter", "label=tentacle.cluster="+name)
+	cmd := dockerCommand(ctx, "ps", "-q", "--filter", "label=tentacle.cluster="+name)
 	output, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("failed to list containers: %w", err)
@@ -1420,7 +1507,7 @@ func GetClusterLogs(ctx context.Context, name string) (string, error) {
 
 	var logs strings.Builder
 	for _, id := range containerIDs {
-		cmd = exec.CommandContext(ctx, "docker", "logs", "--tail", "100", id)
+		cmd = dockerCommand(ctx, "logs", "--tail", "100", id)
 		containerLogs, err := cmd.CombinedOutput()
 		if err != nil {
 			continue
@@ -1565,7 +1652,7 @@ func (c *Cluster) waitForManagerDB(ctx context.Context) error {
 		}
 
 		// Use docker exec to check if cqlsh works
-		cmd := exec.CommandContext(ctx, "docker", "exec", managerDBContainer,
+		cmd := dockerCommand(ctx, "exec", managerDBContainer,
 			"cqlsh", "-e", "SELECT now() FROM system.local")
 		if err := cmd.Run(); err == nil {
 			return nil
@@ -1592,7 +1679,7 @@ func (c *Cluster) waitForManager(ctx context.Context) error {
 		}
 
 		// Use sctool status to check if manager is ready
-		cmd := exec.CommandContext(ctx, "docker", "exec", managerContainer, "sctool", "status")
+		cmd := dockerCommand(ctx, "exec", managerContainer, "sctool", "status")
 		if err := cmd.Run(); err == nil {
 			return nil
 		}
@@ -1617,7 +1704,7 @@ func (c *Cluster) registerClusterWithManager(ctx context.Context) error {
 
 	// Register the cluster using sctool
 	// sctool cluster add --name <name> --host <host> --auth-token <token>
-	cmd := exec.CommandContext(ctx, "docker", "exec", managerContainer,
+	cmd := dockerCommand(ctx, "exec", managerContainer,
 		"sctool", "cluster", "add",
 		"--name", c.Config.Name,
 		"--host", firstNodeContainer,
@@ -1641,7 +1728,7 @@ func ensureAioMaxNr() error {
 
 	// Use nsenter to access the Docker VM's /proc filesystem
 	// This works on Docker Desktop for Mac/Windows
-	cmd := exec.Command("docker", "run", "--rm", "--privileged", "--pid=host",
+	cmd := dockerCommand(context.TODO(), "run", "--rm", "--privileged", "--pid=host",
 		"justincormack/nsenter1", "/bin/sh", "-c",
 		fmt.Sprintf("echo %s > /proc/sys/fs/aio-max-nr", requiredValue))
 
