@@ -867,7 +867,7 @@ func FindAvailablePort(nodeCount int) (int, error) {
 			shardPort := basePort + 10000 + i
 			// Check both the used set AND actual port availability
 			if usedSet[cqlPort] || usedSet[shardPort] ||
-			   !isPortAvailable(cqlPort) || !isPortAvailable(shardPort) {
+				!isPortAvailable(cqlPort) || !isPortAvailable(shardPort) {
 				conflict = true
 				break
 			}
@@ -966,7 +966,7 @@ func FindAvailableManagerPort() (int, error) {
 
 		// Check both that the ports aren't in our used set AND that they're actually available
 		if !usedSet[httpPort] && !usedSet[httpsPort] &&
-		   isPortAvailable(httpPort) && isPortAvailable(httpsPort) {
+			isPortAvailable(httpPort) && isPortAvailable(httpsPort) {
 			return basePort, nil
 		}
 		basePort++
